@@ -448,6 +448,186 @@ fn test_eip7708_selfdestruct_to_different_address() {
     );
 }
 
+/// Reproduces a bug where `RevertToSlot::Destroyed` is produced for a
+/// pre-existing DB storage slot when a SELFDESTRUCT → CREATE2 cycle occurs
+/// as the first block of a batch.
+///
+/// End-to-end test using real EVM execution with two transactions:
+/// 1. Tx1: Calls the child contract which SELFDESTRUCTs
+/// 2. Tx2: Factory CREATE2s the child back with SSTORE(slot0, 1)
+/// 3. The bundle revert should record Some(1) for slot(0) but instead
+///    records Destroyed, which maps to 0 on unwind.
+///
+/// Inspired by Ethereum mainnet block 10,094,566.
+#[test]
+fn selfdestruct_create2_revert_loses_db_storage_value() {
+    use revm::{
+        bytecode::opcode,
+        context::{CfgEnv, Context, TxEnv},
+        database::{
+            states::bundle_state::BundleRetention, InMemoryDB, RevertToSlot, State,
+        },
+        primitives::{address, hardfork::SpecId, Bytes, StorageKey, StorageValue, TxKind},
+        state::{AccountInfo, Bytecode},
+        ExecuteCommitEvm, MainBuilder, MainContext,
+    };
+
+    // ── Child contract runtime bytecode ──
+    // SELFDESTRUCTs to caller when called.
+    let child_runtime: &[u8] = &[
+        opcode::CALLER,
+        opcode::SELFDESTRUCT,
+    ];
+
+    // ── Child init code ──
+    // SSTORE(0, 1) during init, then deploys runtime bytecode.
+    let runtime_len = child_runtime.len() as u8;
+    let init_code_bytes: Vec<u8> = {
+        let mut code = Vec::new();
+        // SSTORE(0, 1)
+        code.extend_from_slice(&[opcode::PUSH1, 0x01, opcode::PUSH1, 0x00, opcode::SSTORE]);
+        // CODECOPY(destOffset=0, offset=<after_return>, size=runtime_len)
+        let header_len = 5 + 12; // 5 for SSTORE above, 12 for CODECOPY+RETURN below
+        code.extend_from_slice(&[
+            opcode::PUSH1, runtime_len,
+            opcode::PUSH1, header_len as u8,
+            opcode::PUSH1, 0x00,
+            opcode::CODECOPY,
+            opcode::PUSH1, runtime_len,
+            opcode::PUSH1, 0x00,
+            opcode::RETURN,
+        ]);
+        code.extend_from_slice(child_runtime);
+        code
+    };
+    let child_init_code: Bytes = init_code_bytes.into();
+    let child_init_code_len = child_init_code.len();
+
+    let factory_addr = address!("0x1000000000000000000000000000000000000000");
+    let caller = address!("0xf000000000000000000000000000000000000000");
+    let salt = [0u8; 32];
+    let child_addr = factory_addr.create2_from_code(salt, &child_init_code);
+
+    // ── Factory runtime: stores init code in memory then CREATE2 ──
+    let mut factory_code = Vec::new();
+    for (i, &b) in child_init_code.iter().enumerate() {
+        factory_code.extend_from_slice(&[opcode::PUSH1, b, opcode::PUSH1, i as u8, opcode::MSTORE8]);
+    }
+    // CREATE2(value=0, offset=0, size=len, salt=0)
+    factory_code.push(opcode::PUSH32);
+    factory_code.extend_from_slice(&salt);
+    factory_code.extend_from_slice(&[opcode::PUSH1, child_init_code_len as u8]);
+    factory_code.extend_from_slice(&[opcode::PUSH1, 0x00]); // offset
+    factory_code.extend_from_slice(&[opcode::PUSH1, 0x00]); // value
+    factory_code.extend_from_slice(&[opcode::CREATE2, opcode::POP, opcode::STOP]);
+
+    // ── Set up DB with pre-existing child ──
+    let mut db = InMemoryDB::default();
+    db.insert_account_info(caller, AccountInfo {
+        balance: U256::from(1_000_000_000_000_000_000u128),
+        ..Default::default()
+    });
+    db.insert_account_info(factory_addr, AccountInfo {
+        code: Some(Bytecode::new_legacy(factory_code.into())),
+        ..Default::default()
+    });
+    // Child exists in DB with slot(0) = 1
+    db.insert_account_info(child_addr, AccountInfo {
+        nonce: 1,
+        code: Some(Bytecode::new_legacy(child_runtime.into())),
+        ..Default::default()
+    });
+    db.insert_account_storage(child_addr, StorageKey::default(), StorageValue::from(1))
+        .unwrap();
+
+    // ── Wrap in State for bundle tracking ──
+    let mut state = State::builder()
+        .with_database(db)
+        .with_bundle_update()
+        .build();
+
+    let mut evm = Context::mainnet()
+        .modify_cfg_chained(|cfg| {
+            cfg.set_spec_and_mainnet_gas_params(SpecId::BERLIN);
+            cfg.disable_nonce_check = true;
+        })
+        .with_db(&mut state)
+        .build_mainnet();
+
+    // Tx1: Call child → triggers SELFDESTRUCT
+    let result1 = evm.transact_commit(
+        TxEnv::builder()
+            .caller(caller)
+            .kind(TxKind::Call(child_addr))
+            .gas_limit(100_000)
+            .gas_price(0)
+            .build()
+            .unwrap(),
+    ).unwrap();
+    assert!(result1.is_success(), "Tx1 (selfdestruct) failed: {result1:?}");
+
+    // Tx2: Call factory → CREATE2 recreates child with SSTORE(0, 1)
+    let result2 = evm.transact_commit(
+        TxEnv::builder()
+            .caller(caller)
+            .kind(TxKind::Call(factory_addr))
+            .gas_limit(1_000_000)
+            .gas_price(0)
+            .nonce(1)
+            .build()
+            .unwrap(),
+    ).unwrap();
+    assert!(result2.is_success(), "Tx2 (create2) failed: {result2:?}");
+
+    // ── Merge transitions into bundle ──
+    drop(evm);
+    state.merge_transitions(BundleRetention::Reverts);
+    let bundle = state.take_bundle();
+
+    // ── Verify the bundle state: child should exist with slot(0) = 1 ──
+    let child_account = bundle.account(&child_addr).expect("child should be in bundle state");
+    let slot_value = child_account
+        .storage
+        .get(&StorageKey::default())
+        .expect("slot(0) should be in child's bundle storage");
+    assert_eq!(
+        slot_value.present_value,
+        StorageValue::from(1),
+        "slot(0) should be 1 after CREATE2 + SSTORE"
+    );
+
+    // ── Verify the revert ──
+    let child_revert = bundle
+        .reverts
+        .iter()
+        .flatten()
+        .find(|(addr, _)| *addr == child_addr);
+
+    assert!(
+        child_revert.is_some(),
+        "Expected revert entry for child contract at {child_addr}"
+    );
+    let (_, revert) = child_revert.unwrap();
+
+    let slot_revert = revert.storage.get(&StorageKey::default());
+    if let Some(slot_revert) = slot_revert {
+        // BUG: We get Destroyed (→ to_previous_value() = 0) instead of Some(1).
+        // On unwind, reth would write 0 to slot(0) instead of restoring 1.
+        //
+        // Expected:
+        // assert_eq!(*slot_revert, RevertToSlot::Some(StorageValue::from(1)));
+        //
+        // Actual:
+        assert_eq!(
+            *slot_revert,
+            RevertToSlot::Destroyed,
+            "BUG: slot(0) revert should be Some(1) but got Destroyed"
+        );
+    } else {
+        panic!("slot(0) missing from revert entirely");
+    }
+}
+
 /// Init code that selfdestructs to itself during construction
 /// This triggers the selfdestruct-to-self scenario where a newly created
 /// contract (is_created_locally = true) selfdestructs to itself.
